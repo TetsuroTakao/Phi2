@@ -23,15 +23,22 @@ webbuilder.Services.AddLogging();
 #endregion
 
 #region  WebApp build
-webbuilder.Services.Configure<AIKeyStore>(webbuilder.Configuration.GetSection("AI")).Configure<IServiceProvider>((provider)=>{
-    // Define the using statement to release the scoped service per request when using IOptionsSnapshot to acquire re-bound configuration settings per the Post request.
-    using var scope = provider.CreateScope();// Create scope per request in the root IServiceProvider.
-    var scopedservice = scope.ServiceProvider.GetRequiredService<AIKeyStore>();// This is request-scoped service.
-    scopedservice.UseAzure = true;
-    // scopedservice.GetValueContainer(useAzure: true, useVolatile: false); // Request-scoped service creates a request-scoped configuration container isolated from one another for individual requests.
-}); // Set values from configuration values to the created request-scoped configuration set.
-webbuilder.Services.AddScoped<AIKeyStore>();// Values binded request-scoped option service is added to root service collection.
-
+webbuilder.Services.Configure<AIKeyStore>(AIKeyStore.OpenAIType, webbuilder.Configuration.GetSection("AI:OpenAI"));
+webbuilder.Services.Configure<AIKeyStore>(AIKeyStore.BingType, webbuilder.Configuration.GetSection("AI:Bing"));
+webbuilder.Services.Configure<AIKeyStore>(AIKeyStore.MilvusType, webbuilder.Configuration.GetSection("AI:Milvus"));
+webbuilder.Services.Configure<AIKeyStore>(AIKeyStore.HuggingFaceType, webbuilder.Configuration.GetSection("AI:HuggingFace"));
+webbuilder.Services.Configure<AIKeyStore>(AIKeyStore.SearchServiceType, webbuilder.Configuration.GetSection("AI:SearchService"));
+webbuilder.Services.Configure<AIKeyStore>(AIKeyStore.TextAnalyticsType, webbuilder.Configuration.GetSection("AI:TextAnalytics"));
+#region scope build
+// webbuilder.Services.Configure<AIKeyStore>(webbuilder.Configuration.GetSection("AI")).Configure<IServiceProvider>((provider)=>{
+//     // Define the using statement to release the scoped service per request when using IOptionsSnapshot to acquire re-bound configuration settings per the Post request.
+//     using var scope = provider.CreateScope();// Create scope per request in the root IServiceProvider.
+//     var scopedservice = scope.ServiceProvider.GetRequiredService<AIKeyStore>();// This is request-scoped service.
+//     scopedservice.UseAzure = true;
+//     // scopedservice.GetValueContainer(useAzure: true, useVolatile: false); // Request-scoped service creates a request-scoped configuration container isolated from one another for individual requests.
+// }); // Set values from configuration values to the created request-scoped configuration set.
+// webbuilder.Services.AddScoped<AIKeyStore>();// Values binded request-scoped option service is added to root service collection.
+#endregion
 #region TODO Cleanup(include kernel build)
 var kernelbuilder = Kernel.CreateBuilder();
 // .AddAzureOpenAITextEmbeddingGeneration("PromptFlowDeploy", apiKey!, generationService!)
@@ -42,12 +49,6 @@ kernelbuilder.Plugins.AddFromType<TimePlugin>();
 kernelbuilder.Plugins.AddFromType<TravelExpensisPlugIn>();
 Kernel kernel = kernelbuilder.Build();
 #endregion
-#endregion
-
-#region bing build
-using ILoggerFactory factory = LoggerFactory.Create(provider => provider.AddConsole());
-var apiKeyBing = webbuilder.Configuration["AI:Bing:APIKey"];
-var bingConnector = new BingConnector(apiKeyBing!, factory);
 #endregion
 
 #region  memory build
@@ -92,7 +93,13 @@ webapp.MapGet("/oops", () => "Oops! An error happened.").WithMetadata(new Swagge
 // Use IOptionsSnapshot to define scope for security
 webapp.MapPost("/CreateTransportationPlan", ([FromBody] string query, IOptionsSnapshot<AIKeyStore> settings) => {
     var result = new List<string>();
-    var keyStore = settings.Value;
+    var keyStore = new List<AIKeyStore>();
+    keyStore.Add(settings.Get(AIKeyStore.TextAnalyticsType));
+    keyStore.Add(settings.Get(AIKeyStore.OpenAIType));
+    keyStore.Add(settings.Get(AIKeyStore.BingType));
+    keyStore.Add(settings.Get(AIKeyStore.MilvusType));
+    keyStore.Add(settings.Get(AIKeyStore.HuggingFaceType));
+    keyStore.Add(settings.Get(AIKeyStore.SearchServiceType));
     #region TODO Cleanup
     // result.Add("keyStore.UseAzure:" + keyStore.UseAzure);
     // result.Add("KeyStore.OpenAI.Deployment:" + keyStore.OpenAI.Deployment);
@@ -111,10 +118,14 @@ webapp.MapPost("/CreateTransportationPlan", ([FromBody] string query, IOptionsSn
     // result.Add("KeyStore.Bing.APIKey:" + keyStore.Bing.APIKey);
 
     #endregion
-    var collection = keyStore.UseAzure == true ? keyStore.OpenAI.Deployment : string.Empty;
-    var db = new PolyglotPersistencePlugin(keyStore);
-    var searchResult = db.SearchGeneric(query,collection).Result;
+    var db = new PolyglotPersistencePlugin(keyStore, false, false);
+    var searchResult = db.SearchGeneric(query,keyStore.Where(s => s.SettingsName==AIKeyStore.BingType).FirstOrDefault()!.OptionalID).Result;
     if(searchResult==PolyglotPersistencePlugin.NotFound){
+        #region bing build
+        using ILoggerFactory factory = LoggerFactory.Create(provider => provider.AddConsole());
+        var apiKeyBing = keyStore.Where(s => s.SettingsName==AIKeyStore.BingType).FirstOrDefault()!.APIKey;
+        var bingConnector = new BingConnector(apiKeyBing!, factory);
+        #endregion
         foreach (var item in bingConnector.SearchAsync(query, 10).Result)
         {
             result.Add(item);
@@ -130,18 +141,69 @@ webapp.MapPost("/CreateTransportationPlan", ([FromBody] string query, IOptionsSn
 // webapp.MapPost("/DetectLanguage", ([FromBody] string query, IOptionsSnapshot<AIKeyStore> settings) => {
 webapp.MapPost("/DetectLanguage", ([FromBody] string query, IOptionsSnapshot<AIKeyStore> settings) => {
     var result = string.Empty;
-    var keyStore = settings.Value;
+    var keyStore = new List<AIKeyStore>();
+    keyStore.Add(settings.Get(AIKeyStore.TextAnalyticsType));
+    keyStore.Add(settings.Get(AIKeyStore.OpenAIType));
+    keyStore.Add(settings.Get(AIKeyStore.BingType));
+    keyStore.Add(settings.Get(AIKeyStore.MilvusType));
+    keyStore.Add(settings.Get(AIKeyStore.SearchServiceType));
+    keyStore.Add(settings.Get(AIKeyStore.HuggingFaceType));
     // keyStore.UseAzure = true;
-    var db = new PolyglotPersistencePlugin(keyStore);
+    var db = new PolyglotPersistencePlugin(keyStore, true, false);
     // var searchResult = db.DetectLanguage(query).Result;
     try
     {
         result = db.DetectLanguage(query);
     }
-    catch (System.Exception)
+    catch (System.Exception e)
     {
-        result = keyStore.UseAzure.ToString();
+        result = e.Message + e.InnerException?.Message;
     }
-    return result + $"keyStore.UseAzure = [{keyStore.UseAzure}]";
+    return  $"DetectLanguage result = [{result}]";
 });
+
+webapp.MapPost("/KeyPhrase", ([FromBody] string query, IOptionsSnapshot<AIKeyStore> settings) => {
+    var result = string.Empty;
+    var keyStore = new List<AIKeyStore>();
+    keyStore.Add(settings.Get(AIKeyStore.TextAnalyticsType));
+    keyStore.Add(settings.Get(AIKeyStore.OpenAIType));
+    keyStore.Add(settings.Get(AIKeyStore.BingType));
+    keyStore.Add(settings.Get(AIKeyStore.MilvusType));
+    keyStore.Add(settings.Get(AIKeyStore.SearchServiceType));
+    keyStore.Add(settings.Get(AIKeyStore.HuggingFaceType));
+    // keyStore.UseAzure = true;
+    var db = new PolyglotPersistencePlugin(keyStore, true, false);
+    // var searchResult = db.DetectLanguage(query).Result;
+    try
+    {
+        result = db.GetKeyPhrase(query);
+    }
+    catch (System.Exception e)
+    {
+        result = e.Message + e.InnerException?.Message;
+    }
+    return  $"DetectLanguage result = [{result}]";
+});
+
+webapp.MapPost("/GetVector", ([FromBody] string query, IOptionsSnapshot<AIKeyStore> settings) => {
+    var result = string.Empty;
+    var keyStore = new List<AIKeyStore>();
+    keyStore.Add(settings.Get(AIKeyStore.TextAnalyticsType));
+    keyStore.Add(settings.Get(AIKeyStore.OpenAIType));
+    keyStore.Add(settings.Get(AIKeyStore.BingType));
+    keyStore.Add(settings.Get(AIKeyStore.MilvusType));
+    keyStore.Add(settings.Get(AIKeyStore.SearchServiceType));
+    keyStore.Add(settings.Get(AIKeyStore.HuggingFaceType));
+    var db = new PolyglotPersistencePlugin(keyStore, true, false);
+    try
+    {
+        result = db.GetVector(query);
+    }
+    catch (System.Exception e)
+    {
+        result = e.Message + e.InnerException?.Message;
+    }
+    return  $"GetVector result = [{result}]";
+});
+
 webapp.Run();

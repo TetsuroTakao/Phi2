@@ -6,10 +6,14 @@ using Microsoft.SemanticKernel.Memory;
 using Microsoft.SemanticKernel.Connectors.HuggingFace;
 using Microsoft.SemanticKernel.Embeddings;
 using Microsoft.SemanticKernel.Connectors.AzureAISearch;
+using Microsoft.SemanticKernel.Text;// TextChunker
 using Azure;
 using Azure.AI.TextAnalytics;
 using Azure.Core;
-using System.Net;
+using Azure.AI.OpenAI;
+using Microsoft.ML;
+using Microsoft.ML.Tokenizers;
+using Json.More;
 public class PolyglotPersistencePlugin
 {
     #region Fields
@@ -18,7 +22,10 @@ public class PolyglotPersistencePlugin
     IMemoryStore memoryStore {get; set;} = null!;
     SemanticTextMemory textMemory {get; set;} = null!;
     TextAnalyticsClient textAnalyticsClient {get; set;} = null!;
-    // string debugger {get; set;} = string.Empty;
+    OpenAIClient openAIClient {get;set;} = null!;
+    EmbeddingsOptions embeddingsOptions {get; set;} = null!;
+    string ModelID {get; set;} = null!;
+    string debugger {get; set;} = string.Empty;
     public const string NotFound = "No answer found";
     #endregion
     #region Milvus
@@ -30,34 +37,42 @@ public class PolyglotPersistencePlugin
         if(databases.Where(x => x == dbName).Count() == 0 ) await milvusClient.CreateDatabaseAsync(dbName);
     }
     #endregion
-    public PolyglotPersistencePlugin(AIKeyStore store)
+    public PolyglotPersistencePlugin(List<AIKeyStore> settings, bool useAzure=false, bool useeVolatile=false)
     {
-        if(store.UseAzure)
+        AIKeyStore store;
+        if(useAzure)
         {
-            embeddingGenerator = new AzureOpenAITextEmbeddingGenerationService(deploymentName: store.OpenAI.Deployment, endpoint: store.OpenAI.Endpoint, apiKey: store.OpenAI.APIKey, modelId: store.OpenAI.GenerationService);
-            memoryStore = new AzureAISearchMemoryStore(store.SearchService.Endpoint, store.SearchService.Key);
+            store = settings.Where(s => s.SettingsName==AIKeyStore.OpenAIType).FirstOrDefault()!;    
+            var searchstore = settings.Where(s => s.SettingsName==AIKeyStore.SearchServiceType).FirstOrDefault()!;
+            embeddingGenerator = new AzureOpenAITextEmbeddingGenerationService(deploymentName: store.OptionalID , endpoint: store.ServiceEndpoint, apiKey: store.APIKey, modelId: store.ModelID);
+            memoryStore = new AzureAISearchMemoryStore(searchstore.ServiceEndpoint, searchstore.APIKey);
         }
         else
         {
-            var hostname = new Uri(store.Milvus.Endpoint).Host;
-            var portnumber = new Uri(store.Milvus.Endpoint).Port;
-            dbName = store.Milvus.DBName;
+            store = settings.Where(s => s.SettingsName==AIKeyStore.MilvusType).FirstOrDefault()!;
+            var searchstore = settings.Where(s => s.SettingsName==AIKeyStore.HuggingFaceType).FirstOrDefault()!;
+            var hostname = new Uri(store.LocalEndpoint).Host;
+            var portnumber = new Uri(store.LocalEndpoint).Port;
+            dbName = store.OptionalID;
             milvusClient = new Milvus.Client.MilvusClient(host: hostname, port: portnumber, ssl:false);
-            embeddingGenerator = new HuggingFaceTextEmbeddingGenerationService(store.HuggingFace.ModelID, new Uri(store.HuggingFace.Endpoint), $"Bearer {store.HuggingFace.APIKey}");
+            embeddingGenerator = new HuggingFaceTextEmbeddingGenerationService(searchstore.ModelID, new Uri(searchstore.ServiceEndpoint), $"Bearer {searchstore.APIKey}");
             memoryStore = new MilvusMemoryStore(milvusClient, dbName, vectorSize: 1536, Milvus.Client.SimilarityMetricType.Ip);
         }
-        if(store.UseVolatile)
+        if(useeVolatile)
         {
             #pragma warning disable SKEXP0050
             memoryStore = new VolatileMemoryStore();
         }
         textMemory = new(memoryStore, embeddingGenerator);
-        AzureKeyCredential credential = new(store.TextAnalytics.APIKey);
-        var endpoint = store.UseAzure == true ? store.TextAnalytics.Endpoint : store.TextAnalytics.LocalAddress;
+        ModelID = store.ModelID;
+        AzureKeyCredential credential = new(settings.Where(s => s.SettingsName==AIKeyStore.TextAnalyticsType).FirstOrDefault()!.APIKey);
+        var endpoint = useAzure == true ? settings.Where(s => s.SettingsName==AIKeyStore.TextAnalyticsType).FirstOrDefault()!.ServiceEndpoint : settings.Where(s => s.SettingsName==AIKeyStore.TextAnalyticsType).FirstOrDefault()!.LocalEndpoint;
         var options = new TextAnalyticsClientOptions(){Retry = { Delay = TimeSpan.FromSeconds(2), MaxDelay = TimeSpan.FromSeconds(16), MaxRetries = 3, Mode = RetryMode.Exponential}};
         options.Retry.NetworkTimeout = TimeSpan.FromSeconds(10);
         textAnalyticsClient = new(new Uri(endpoint), credential, options);
-        // debugger = store.UseAzure.ToString();
+        debugger = $"endpoint:{endpoint}, Key:{credential.Key}";
+        openAIClient =new OpenAIClient(new Uri(store.ServiceEndpoint), new AzureKeyCredential(store.APIKey));
+        embeddingsOptions = new EmbeddingsOptions(){ DeploymentName = store.ModelID};
     }
     #region TODO Cleanup
     public bool IsDefault { get; set; } = false;
@@ -69,7 +84,7 @@ public class PolyglotPersistencePlugin
         return state;
     }
     #endregion
-    #region TODO Cleanup
+    #region Persistence Milvus
         // [KernelFunction]
         // [Description("Gets the Kernel memory type.")]
         public async Task<string> MilvusINPUT(string input)
@@ -113,8 +128,6 @@ public class PolyglotPersistencePlugin
         }
         return ans == string.Empty ? NotFound : ans!;
     }
-    
-    // 
     // public async Task<string> DetectLanguage(string input)
     public string DetectLanguage(string input)
     {
@@ -122,19 +135,73 @@ public class PolyglotPersistencePlugin
         try
         {
             // Response<DetectedLanguage> response = await textAnalyticsClient.DetectLanguageAsync(input);
-            Response<DetectedLanguage> response = textAnalyticsClient.DetectLanguageAsync(input).Result;
-            DetectedLanguage language = response.Value;
-            res.Add(new KeyValuePair<string,string>("name",$"{language.Name}"));
-            res.Add(new KeyValuePair<string,string>("score",$"{language.ConfidenceScore}"));
+            Response<DetectedLanguage> response = textAnalyticsClient.DetectLanguage(input);
+            // DetectedLanguage language = response.Value;
+            // res.Add(new KeyValuePair<string,string>("name",$"{language.Name}"));
+            // res.Add(new KeyValuePair<string,string>("reliable",$"{language.ConfidenceScore}"));
+            res.Add(new KeyValuePair<string,string>("debugger",$"{debugger}"));
         }
         catch (RequestFailedException exception)
         {
-            Console.WriteLine($"Error Code: {exception.ErrorCode}");
-            Console.WriteLine($"Message: {exception.Message}");
             res.Add(new KeyValuePair<string,string>("code",$"{exception.ErrorCode}"));
             res.Add(new KeyValuePair<string,string>("Message",$"{exception.Message}"));
+            res.Add(new KeyValuePair<string,string>("InnerException Message",$"{exception.InnerException!.Message}"));
         }
-        // return res.Where(kv => kv.Key == "name").FirstOrDefault().Value ?? res.Where(kv => kv.Key == "code").FirstOrDefault().Value;
         return string.Join(",", res.Select(kv => $"{kv.Key}:{kv.Value}"));
     }
+    public string GetKeyPhrase(string input)
+    {
+        var res = new List<KeyValuePair<string,string>>();
+        try
+        {
+            Response<KeyPhraseCollection> response = textAnalyticsClient.ExtractKeyPhrases(input);
+            foreach (string keyphrase in response.Value)
+            {
+                res.Add(new KeyValuePair<string,string>("keyphrase",$"{keyphrase}"));
+            }
+        }
+        catch (RequestFailedException exception)
+        {
+            res.Add(new KeyValuePair<string,string>("code",$"{exception.ErrorCode}"));
+            res.Add(new KeyValuePair<string,string>("Message",$"{exception.Message}"));
+            res.Add(new KeyValuePair<string,string>("InnerException Message",$"{exception.InnerException!.Message}"));
+        }
+        return string.Join(",", res.Select(kv => $"{kv.Key}:{kv.Value}"));
+    }
+    public string GetVector(string input)
+    {
+        var res = new List<KeyValuePair<string,string>>();
+        try
+        {
+            var lines = TextChunker.SplitPlainTextLines(input, maxTokensPerLine: 10);
+            var paragraphs = TextChunker.SplitPlainTextParagraphs(lines, maxTokensPerParagraph: 25);
+            using var enumerator = paragraphs.GetEnumerator();
+            // IList<string> chunk = new List<string>();
+            float[] vectors = null!;
+            while (enumerator.MoveNext())
+            {
+                var paragraph = enumerator.Current;
+                embeddingsOptions.Input.Add(paragraph);
+            }
+            var embeddings = openAIClient.GetEmbeddings(embeddingsOptions);
+        // var r = embeddings.Value.Data.Chunk<float>(vectors, 8192).ToArray();
+            res.Add(new KeyValuePair<string,string>("Input: ",$"{embeddingsOptions.DeploymentName},"));
+            res.Add(new KeyValuePair<string,string>("Input: ",$"{embeddingsOptions.Input.FirstOrDefault()},"));
+        // var mlContext = new MLContext();
+        // var samples = new List<string>(){"string"};
+        // var dataview = mlContext.Data.LoadFromEnumerable(samples);
+        // var textPipeline = mlContext.Transforms.Text.FeaturizeText("string", "float[]");
+        // var textTransformer = textPipeline.Fit(dataview);
+        // var predictionEngine = mlContext.Model.CreatePredictionEngine<string,float[]>(textTransformer);
+        // var prediction = predictionEngine.Predict(samples[0]);
+        }
+         catch (RequestFailedException exception)
+        {
+            res.Add(new KeyValuePair<string,string>("code",$"{exception.ErrorCode}"));
+            res.Add(new KeyValuePair<string,string>("Message",$"{exception.Message}"));
+            res.Add(new KeyValuePair<string,string>("InnerException Message",$"{exception.InnerException!.Message}"));
+        }
+        return string.Join(",", res.Select(kv => $"{kv.Key}:{kv.Value}"));
+    }
+
 }
